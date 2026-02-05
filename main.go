@@ -13,6 +13,8 @@ import (
 	"github.com/charmbracelet/bubbles/filepicker"
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/progress"
+	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -25,42 +27,46 @@ const (
 // --- Messages ---
 type peerUpdateMsg struct{ name, ip string }
 type transferStatusMsg string
+type chatMsg struct{ sender, content string }
 type progressMsg float64
 
 type item struct{ title, desc string }
-
 func (i item) Title() string       { return i.title }
 func (i item) Description() string { return i.desc }
 func (i item) FilterValue() string { return i.title }
 
 // --- Model ---
 type model struct {
-	state       int // 0: list, 1: picker, 2: progress
+	state       int // 0: list, 1: picker, 2: progress, 3: chat
 	list        list.Model
 	filepicker  filepicker.Model
 	progress    progress.Model
+	textInput   textinput.Model
+	viewport    viewport.Model
 	selectedIP  string
 	lastStatus  string
+	chatHistory []string
 	networkChan chan interface{}
 	userName    string
-	width       int
-	height      int
 }
 
 func initialModel(name string, netChan chan interface{}) model {
 	l := list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0)
-	l.Title = "Peer: " + name + " | (f) Send File (q) Quit"
+	l.Title = "Peer: " + name + " | (f) File (enter) Chat (q) Quit"
 
 	fp := filepicker.New()
-	fp.AllowedTypes = []string{".jpg", ".png", ".txt", ".go", ".mp4", ".pdf", ".zip", ".mod", ".sum"}
-	dir, _ := os.Getwd()
-	fp.CurrentDirectory = dir
+	fp.CurrentDirectory, _ = os.Getwd()
+
+	ti := textinput.New()
+	ti.Placeholder = "Type a message..."
+	ti.Focus()
 
 	return model{
 		state:       0,
 		list:        l,
 		filepicker:  fp,
 		progress:    progress.New(progress.WithDefaultGradient()),
+		textInput:   ti,
 		networkChan: netChan,
 		userName:    name,
 	}
@@ -77,40 +83,57 @@ func waitForNetwork(ch chan interface{}) tea.Cmd {
 // --- Update ---
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
-	// var cmds []tea.Cmd
+	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "ctrl+c", "q":
-			return m, tea.Quit
+		case "ctrl+c", "q": return m, tea.Quit
 		case "f":
 			if m.state == 0 && m.list.SelectedItem() != nil {
 				m.selectedIP = m.list.SelectedItem().(item).desc
 				m.state = 1
-				// Re-initialize picker view
 				return m, m.filepicker.Init()
 			}
-		case "esc":
-			m.state = 0
+		case "enter":
+			if m.state == 0 && m.list.SelectedItem() != nil {
+				m.selectedIP = m.list.SelectedItem().(item).desc
+				m.state = 3
+				return m, nil
+			} else if m.state == 3 && m.textInput.Value() != "" {
+				text := m.textInput.Value()
+				m.textInput.Reset()
+				m.chatHistory = append(m.chatHistory, "Me: "+text)
+				m.viewport.SetContent(strings.Join(m.chatHistory, "\n"))
+				m.viewport.GotoBottom()
+				return m, m.sendChatCmd(text)
+			}
+		case "esc": m.state = 0
 		}
 
 	case peerUpdateMsg:
 		m.list.InsertItem(0, item{title: msg.name, desc: msg.ip})
 		return m, waitForNetwork(m.networkChan)
 
+	case chatMsg:
+		m.chatHistory = append(m.chatHistory, msg.sender+": "+msg.content)
+		m.viewport.SetContent(strings.Join(m.chatHistory, "\n"))
+		m.viewport.GotoBottom()
+		return m, waitForNetwork(m.networkChan)
+
 	case transferStatusMsg:
 		m.state = 0
 		m.lastStatus = string(msg)
-		return m, nil
+		return m, waitForNetwork(m.networkChan)
 
 	case tea.WindowSizeMsg:
-		m.width, m.height = msg.Width, msg.Height
 		m.list.SetSize(msg.Width-4, msg.Height-8)
 		m.filepicker.Height = msg.Height - 10
 		m.progress.Width = msg.Width - 10
+		m.viewport = viewport.New(msg.Width-4, msg.Height-10)
 	}
 
+	// Route updates
 	if m.state == 1 {
 		m.filepicker, cmd = m.filepicker.Update(msg)
 		if didSelect, path := m.filepicker.DidSelectFile(msg); didSelect {
@@ -118,19 +141,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.sendFileCmd(path)
 		}
 		return m, cmd
+	} else if m.state == 3 {
+		m.textInput, cmd = m.textInput.Update(msg)
+		cmds = append(cmds, cmd)
+		m.viewport, cmd = m.viewport.Update(msg)
+		cmds = append(cmds, cmd)
+	} else {
+		m.list, cmd = m.list.Update(msg)
+		cmds = append(cmds, cmd)
 	}
 
-	m.list, cmd = m.list.Update(msg)
-	return m, cmd
+	return m, tea.Batch(cmds...)
 }
 
 func (m model) View() string {
 	s := lipgloss.NewStyle().Margin(1, 2)
 	switch m.state {
-	case 1:
-		return s.Render("Select File (Enter to select, Esc to go back):\n\n" + m.filepicker.View())
-	case 2:
-		return s.Render(fmt.Sprintf("Sending to %s...\n\n%s", m.selectedIP, m.progress.View()))
+	case 1: return s.Render("Select File (Enter to select, Esc to go back):\n\n" + m.filepicker.View())
+	case 2: return s.Render(fmt.Sprintf("Sending to %s...\n\n%s", m.selectedIP, m.progress.View()))
+	case 3:
+		return s.Render(fmt.Sprintf("Chat with %s\n\n%s\n\n%s", m.selectedIP, m.viewport.View(), m.textInput.View()))
 	default:
 		return s.Render(m.list.View() + "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Render(m.lastStatus))
 	}
@@ -138,53 +168,49 @@ func (m model) View() string {
 
 // --- Networking ---
 
+func (m model) sendChatCmd(text string) tea.Cmd {
+	return func() tea.Msg {
+		conn, err := net.DialTimeout("tcp", m.selectedIP+":"+portTCP, 2*time.Second)
+		if err != nil { return transferStatusMsg("Chat error: " + err.Error()) }
+		defer conn.Close()
+		fmt.Fprintf(conn, "CHAT:%s:%s\n", m.userName, text)
+		return nil
+	}
+}
+
 func (m model) sendFileCmd(path string) tea.Cmd {
 	return func() tea.Msg {
-		file, err := os.Open(path)
-		if err != nil {
-			return transferStatusMsg("File Error: " + err.Error())
-		}
+		file, _ := os.Open(path)
 		defer file.Close()
 		fInfo, _ := file.Stat()
-
-		conn, err := net.DialTimeout("tcp", m.selectedIP+":"+portTCP, 3*time.Second)
-		if err != nil {
-			return transferStatusMsg("Connection Error: " + err.Error())
-		}
+		conn, _ := net.Dial("tcp", m.selectedIP+":"+portTCP)
 		defer conn.Close()
-
 		fmt.Fprintf(conn, "FILE:%s\n", fInfo.Name())
-		resp, _ := bufio.NewReader(conn).ReadString('\n')
-		if !strings.Contains(resp, "ACCEPTED") {
-			return transferStatusMsg("Peer rejected")
-		}
-
+		bufio.NewReader(conn).ReadString('\n') // Wait for ACCEPTED
 		io.Copy(conn, file)
 		return transferStatusMsg("Sent: " + fInfo.Name())
 	}
 }
 
 func startTCPServer(netChan chan interface{}) {
-	ln, err := net.Listen("tcp", ":"+portTCP)
-	if err != nil {
-		return
-	}
+	ln, _ := net.Listen("tcp", ":"+portTCP)
 	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			continue
-		}
+		conn, _ := ln.Accept()
 		go func(c net.Conn) {
 			defer c.Close()
 			reader := bufio.NewReader(c)
 			header, _ := reader.ReadString('\n')
 			if strings.HasPrefix(header, "FILE:") {
 				fmt.Fprintln(c, "ACCEPTED")
-				fileName := strings.TrimSpace(strings.TrimPrefix(header, "FILE:"))
-				f, _ := os.Create("received_" + fileName)
-				defer f.Close()
+				name := strings.TrimSpace(strings.TrimPrefix(header, "FILE:"))
+				f, _ := os.Create("received_" + name)
 				io.Copy(f, reader)
-				netChan <- transferStatusMsg("Received: " + fileName)
+				netChan <- transferStatusMsg("Received: " + name)
+			} else if strings.HasPrefix(header, "CHAT:") {
+				parts := strings.SplitN(header[5:], ":", 2)
+				if len(parts) == 2 {
+					netChan <- chatMsg{sender: parts[0], content: strings.TrimSpace(parts[1])}
+				}
 			}
 		}(conn)
 	}
@@ -203,24 +229,15 @@ func listenUDP(myName string, netChan chan interface{}) {
 	addr, _ := net.ResolveUDPAddr("udp", ":"+portUDP)
 	conn, _ := net.ListenUDP("udp", addr)
 	buf := make([]byte, 1024)
-
-	// Deduplication Map
 	var discovered sync.Map
-
 	for {
 		n, rAddr, _ := conn.ReadFromUDP(buf)
 		msg := string(buf[:n])
-		ip := rAddr.IP.String()
-
 		if strings.HasPrefix(msg, "IAM:") {
-			peerName := msg[4:]
-			if peerName == myName {
-				continue
-			}
-
-			// Only send to UI if this is a new IP or name
-			if _, seen := discovered.LoadOrStore(ip, peerName); !seen {
-				netChan <- peerUpdateMsg{name: peerName, ip: ip}
+			pName := msg[4:]
+			if pName == myName { continue }
+			if _, seen := discovered.LoadOrStore(rAddr.IP.String(), pName); !seen {
+				netChan <- peerUpdateMsg{name: pName, ip: rAddr.IP.String()}
 			}
 		}
 	}
@@ -231,16 +248,14 @@ func main() {
 		fmt.Println("Usage: go run main.go <yourname>")
 		return
 	}
-	myName := os.Args[1]
+	name := os.Args[1]
 	netChan := make(chan interface{})
-
-	go broadcast(myName)
-	go listenUDP(myName, netChan)
+	go broadcast(name)
+	go listenUDP(name, netChan)
 	go startTCPServer(netChan)
 
-	p := tea.NewProgram(initialModel(myName, netChan), tea.WithAltScreen())
+	p := tea.NewProgram(initialModel(name, netChan), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error: %v", err)
-		os.Exit(1)
 	}
 }
