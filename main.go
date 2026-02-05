@@ -25,15 +25,18 @@ const (
 )
 
 // --- Messages ---
-type peerUpdateMsg struct{ name, ip string }
+type peerUpdateMsg struct{ name, ip, lastMsg string }
 type transferStatusMsg string
 type chatMsg struct{ sender, content string }
 type progressMsg float64
 
-type item struct{ title, desc string }
+// item implements list.Item
+type item struct {
+	title, desc, lastMsg string
+}
 
 func (i item) Title() string       { return i.title }
-func (i item) Description() string { return i.desc }
+func (i item) Description() string { return i.desc + " | " + i.lastMsg }
 func (i item) FilterValue() string { return i.title }
 
 // --- Model ---
@@ -53,7 +56,10 @@ type model struct {
 
 func initialModel(name string, netChan chan interface{}) model {
 	l := list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0)
-	l.Title = "Peer: " + name + " | (f) File (enter) Chat (q) Quit"
+	l.Title = "You are: " + name + " | (f) File (enter) Chat (esc) Back/Quit"
+
+	// Remove 'q' from the help menu
+	l.KeyMap.Quit.SetKeys()
 
 	fp := filepicker.New()
 	fp.CurrentDirectory, _ = os.Getwd()
@@ -87,15 +93,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
-		
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c":
 			return m, tea.Quit
 		case "esc":
-			// This will always take you back to the Peer List (state 0)
+			// 1. If the list is currently in "Filtering" mode, let the list handle it
+			if m.state == 0 && m.list.FilterState() == list.Filtering {
+				// We don't return tea.Quit here; we just let the message fall through
+				// to m.list.Update(msg) at the bottom of the function.
+				break
+			}
+
+			// 2. If we are in the main list and NOT filtering, Esc exits the whole app
+			if m.state == 0 {
+				return m, tea.Quit
+			}
+
+			// 3. Otherwise, Esc acts as a "Back" button from Chat or File Picker
 			m.state = 0
-			m.textInput.Blur() // Stop focusing the text box
+			m.textInput.Blur()
+			m.textInput.Reset()
 			return m, nil
 		case "f":
 			if m.state == 0 && m.list.SelectedItem() != nil {
@@ -116,23 +134,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.viewport.GotoBottom()
 				return m, m.sendChatCmd(text)
 			}
-		case "q":
-			// Only quit on 'q' if we aren't currently in Chat Mode (state 3)
-			// or File Picker mode (state 1)
-			if m.state == 0 {
-				return m, tea.Quit
-			}
 		}
 
 	case peerUpdateMsg:
-		m.list.InsertItem(0, item{title: msg.name, desc: msg.ip})
+		// Check if peer exists to update last message
+		items := m.list.Items()
+		found := false
+		for i, itm := range items {
+			p := itm.(item)
+			if p.desc == msg.ip {
+				p.lastMsg = msg.lastMsg
+				m.list.SetItem(i, p)
+				found = true
+				break
+			}
+		}
+		if !found {
+			m.list.InsertItem(0, item{title: msg.name, desc: msg.ip, lastMsg: "New connection"})
+		}
 		return m, waitForNetwork(m.networkChan)
 
 	case chatMsg:
 		m.chatHistory = append(m.chatHistory, msg.sender+": "+msg.content)
 		m.viewport.SetContent(strings.Join(m.chatHistory, "\n"))
 		m.viewport.GotoBottom()
-		return m, waitForNetwork(m.networkChan)
+		// Also update the preview in the list
+		return m, func() tea.Msg { return peerUpdateMsg{name: msg.sender, ip: "", lastMsg: msg.content} }
 
 	case transferStatusMsg:
 		m.state = 0
@@ -146,7 +173,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport = viewport.New(msg.Width-4, msg.Height-10)
 	}
 
-	// Route updates
 	if m.state == 1 {
 		m.filepicker, cmd = m.filepicker.Update(msg)
 		if didSelect, path := m.filepicker.DidSelectFile(msg); didSelect {
@@ -163,7 +189,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.list, cmd = m.list.Update(msg)
 		cmds = append(cmds, cmd)
 	}
-
 	return m, tea.Batch(cmds...)
 }
 
@@ -175,7 +200,7 @@ func (m model) View() string {
 	case 2:
 		return s.Render(fmt.Sprintf("Sending to %s...\n\n%s", m.selectedIP, m.progress.View()))
 	case 3:
-		return s.Render(fmt.Sprintf("Chat with %s\n\n%s\n\n%s", m.selectedIP, m.viewport.View(), m.textInput.View()))
+		return s.Render(fmt.Sprintf("Chat with %s (Esc to go back)\n\n%s\n\n%s", m.selectedIP, m.viewport.View(), m.textInput.View()))
 	default:
 		return s.Render(m.list.View() + "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Render(m.lastStatus))
 	}
@@ -203,7 +228,7 @@ func (m model) sendFileCmd(path string) tea.Cmd {
 		conn, _ := net.Dial("tcp", m.selectedIP+":"+portTCP)
 		defer conn.Close()
 		fmt.Fprintf(conn, "FILE:%s\n", fInfo.Name())
-		bufio.NewReader(conn).ReadString('\n') // Wait for ACCEPTED
+		bufio.NewReader(conn).ReadString('\n')
 		io.Copy(conn, file)
 		return transferStatusMsg("Sent: " + fInfo.Name())
 	}
@@ -256,7 +281,7 @@ func listenUDP(myName string, netChan chan interface{}) {
 				continue
 			}
 			if _, seen := discovered.LoadOrStore(rAddr.IP.String(), pName); !seen {
-				netChan <- peerUpdateMsg{name: pName, ip: rAddr.IP.String()}
+				netChan <- peerUpdateMsg{name: pName, ip: rAddr.IP.String(), lastMsg: "Connected"}
 			}
 		}
 	}
