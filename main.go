@@ -18,10 +18,14 @@ const (
 )
 
 var (
-	// Maps Name -> IP address
 	peerRegistry    = make(map[string]string)
 	discoveredPeers = make(map[string]time.Time)
 	peerMutex       sync.Mutex
+
+	// System to handle incoming requests without crashing Stdin
+	pendingConn net.Conn
+	pendingName string
+	connMutex   sync.Mutex
 )
 
 func main() {
@@ -31,12 +35,11 @@ func main() {
 
 	if name == "" {
 		fmt.Fprintln(os.Stderr, "Error: --name=ABC is required")
-		flag.Usage()
 		os.Exit(1)
 	}
 
 	fmt.Printf("--- Peer: %s ---\n", name)
-	fmt.Println("Commands: 'exit', 'file <name/ip> <path>', or just '<name/ip>' to chat")
+	fmt.Println("Commands: 'accept', 'reject', 'file <name> <path>', or '<name>' to chat")
 
 	go listenForPeers(name)
 	go broadcastIdentity(name)
@@ -55,20 +58,27 @@ func main() {
 
 		parts := strings.Split(input, " ")
 
-		if parts[0] == "exit" {
+		switch parts[0] {
+		case "exit":
 			os.Exit(0)
-		} else if parts[0] == "file" && len(parts) == 3 {
-			target := resolveTarget(parts[1])
-			sendFile(target, parts[2])
-		} else {
-			// Try to resolve name to IP, otherwise use raw input
+		case "accept":
+			handleAccept()
+		case "reject":
+			handleReject()
+		case "file":
+			if len(parts) == 3 {
+				target := resolveTarget(parts[1])
+				sendFile(target, parts[2])
+			} else {
+				fmt.Println("Usage: file <name/ip> <path>")
+			}
+		default:
 			target := resolveTarget(parts[0])
 			startChatClient(target)
 		}
 	}
 }
 
-// Helper to check if a string is a known peer name, otherwise return original string (IP)
 func resolveTarget(input string) string {
 	peerMutex.Lock()
 	defer peerMutex.Unlock()
@@ -76,6 +86,38 @@ func resolveTarget(input string) string {
 		return ip
 	}
 	return input
+}
+
+// --- CONNECTION HANDLING ---
+
+func handleAccept() {
+	connMutex.Lock()
+	defer connMutex.Unlock()
+
+	if pendingConn == nil {
+		fmt.Println("No pending requests.")
+		return
+	}
+
+	fmt.Fprintln(pendingConn, "ACCEPTED")
+	fmt.Printf("--- Chat with %s (Type '.exit' to stop) ---\n", pendingName)
+
+	runChatSession(pendingConn)
+	pendingConn = nil
+}
+
+func handleReject() {
+	connMutex.Lock()
+	defer connMutex.Unlock()
+
+	if pendingConn == nil {
+		fmt.Println("No request to reject.")
+		return
+	}
+	fmt.Fprintln(pendingConn, "REJECTED")
+	pendingConn.Close()
+	pendingConn = nil
+	fmt.Println("Request rejected.")
 }
 
 // --- DISCOVERY ---
@@ -92,21 +134,19 @@ func broadcastIdentity(hostname string) {
 func listenForPeers(myHost string) {
 	addr, _ := net.ResolveUDPAddr("udp", ":"+portUDP)
 	conn, _ := net.ListenUDP("udp", addr)
-	buf := make([]byte, 1024)
+	readBuf := make([]byte, 1024)
 	for {
-		n, remoteAddr, _ := conn.ReadFromUDP(buf)
-		msg := string(buf[:n])
+		n, remoteAddr, _ := conn.ReadFromUDP(readBuf)
+		msg := string(readBuf[:n])
 		if strings.HasPrefix(msg, "IAM:") {
 			peerName := msg[4:]
 			ip := remoteAddr.IP.String()
 
 			peerMutex.Lock()
 			lastSeen, exists := discoveredPeers[ip]
-			// Update registry
 			peerRegistry[peerName] = ip
-
-			if peerName != myHost && (!exists || time.Since(lastSeen) > 30*time.Second) {
-				fmt.Printf("\n[Found Peer] Name: %s | IP: %s", peerName, ip)
+			if peerName != myHost && (!exists || time.Since(lastSeen) > 60*time.Second) {
+				fmt.Printf("\n[Peer Online] %s (%s)", peerName, ip)
 				fmt.Print("\n> ")
 			}
 			discoveredPeers[ip] = time.Now()
@@ -118,99 +158,79 @@ func listenForPeers(myHost string) {
 // --- TCP SERVER ---
 
 func startTCPServer() {
-	ln, err := net.Listen("tcp", ":"+portTCP)
-	if err != nil {
-		fmt.Printf("Server Error: %v\n", err)
-		return
-	}
+	ln, _ := net.Listen("tcp", ":"+portTCP)
 	for {
 		conn, _ := ln.Accept()
-		go handleIncoming(conn)
-	}
-}
+		go func(c net.Conn) {
+			reader := bufio.NewReader(c)
+			header, _ := reader.ReadString('\n')
+			header = strings.TrimSpace(header)
 
-func handleIncoming(conn net.Conn) {
-	defer conn.Close()
-	reader := bufio.NewReader(conn)
-	header, _ := reader.ReadString('\n')
-	header = strings.TrimSpace(header)
-
-	// Note: In a real terminal app, Scanln here conflicts with the main loop.
-	// For this simple version, we assume the user responds to the prompt.
-	fmt.Printf("\n[Incoming %s] Accept? (y/n): ", header)
-
-	// Use a dedicated scanner for the response to avoid issues
-	var response string
-	fmt.Scanln(&response)
-
-	if strings.ToLower(response) != "y" {
-		fmt.Fprintln(conn, "REJECTED")
-		return
-	}
-	fmt.Fprintln(conn, "ACCEPTED")
-
-	if strings.HasPrefix(header, "FILE:") {
-		fileName := strings.TrimPrefix(header, "FILE:")
-		f, _ := os.Create("received_" + fileName)
-		defer f.Close()
-		io.Copy(f, reader)
-		fmt.Printf("\n[Success] Saved received_%s\n> ", fileName)
-	} else {
-		fmt.Println("--- Chat Started (Type '.exit' to stop) ---")
-		done := make(chan struct{})
-		go func() {
-			io.Copy(os.Stdout, reader)
-			fmt.Println("\n[Peer disconnected]")
-			close(done)
-		}()
-
-		// In-line chat loop
-		inputScanner := bufio.NewScanner(os.Stdin)
-		for inputScanner.Scan() {
-			text := inputScanner.Text()
-			if text == ".exit" {
-				break
+			if strings.HasPrefix(header, "FILE:") {
+				fmt.Fprintln(c, "ACCEPTED")
+				fileName := strings.TrimPrefix(header, "FILE:")
+				f, _ := os.Create("received_" + fileName)
+				io.Copy(f, reader)
+				f.Close()
+				fmt.Printf("\n[System] Received file: received_%s\n> ", fileName)
+				c.Close()
+			} else {
+				connMutex.Lock()
+				pendingConn = c
+				pendingName = c.RemoteAddr().String()
+				connMutex.Unlock()
+				fmt.Printf("\n[Request] Chat from %s. Type 'accept' or 'reject'.\n> ", pendingName)
 			}
-			fmt.Fprintln(conn, text)
-		}
-		fmt.Println("--- Chat Ended ---")
+		}(conn)
 	}
 }
 
-// --- CLIENTS ---
+// --- CHAT LOGIC ---
 
-func startChatClient(ip string) {
-	conn, err := net.DialTimeout("tcp", ip+":"+portTCP, 5*time.Second)
-	if err != nil {
-		fmt.Printf("Connection failed: %v\n", err)
-		return
-	}
-	defer conn.Close()
+func runChatSession(conn net.Conn) {
+	// Read from peer in background
+	go func() {
+		scanner := bufio.NewScanner(conn)
+		for scanner.Scan() {
+			fmt.Printf("\nPeer: %s\n> ", scanner.Text())
+		}
+		fmt.Println("\n[Peer disconnected or chat ended]")
+	}()
 
-	fmt.Fprintf(conn, "CHAT_REQUEST\n")
-
-	respReader := bufio.NewReader(conn)
-	status, _ := respReader.ReadString('\n')
-	if !strings.Contains(status, "ACCEPTED") {
-		fmt.Println("Connection rejected.")
-		return
-	}
-
-	fmt.Println("Connected! Type your message (Type '.exit' to stop):")
-
-	go io.Copy(os.Stdout, respReader)
-
-	inputScanner := bufio.NewScanner(os.Stdin)
-	for inputScanner.Scan() {
-		text := inputScanner.Text()
+	// Write to peer from main thread
+	scanner := bufio.NewScanner(os.Stdin)
+	for scanner.Scan() {
+		text := scanner.Text()
 		if text == ".exit" {
 			break
 		}
 		fmt.Fprintln(conn, text)
+		fmt.Print("> ")
 	}
 }
 
-func sendFile(ip string, path string) {
+func startChatClient(target string) {
+	conn, err := net.DialTimeout("tcp", target+":"+portTCP, 3*time.Second)
+	if err != nil {
+		fmt.Println("Could not connect:", err)
+		return
+	}
+	fmt.Fprintf(conn, "CHAT_REQUEST\n")
+
+	reader := bufio.NewReader(conn)
+	status, _ := reader.ReadString('\n')
+	if !strings.Contains(status, "ACCEPTED") {
+		fmt.Println("Request denied.")
+		conn.Close()
+		return
+	}
+
+	fmt.Println("--- Connected! Type '.exit' to leave ---")
+	runChatSession(conn)
+	conn.Close()
+}
+
+func sendFile(target string, path string) {
 	file, err := os.Open(path)
 	if err != nil {
 		fmt.Println("File error:", err)
@@ -218,24 +238,22 @@ func sendFile(ip string, path string) {
 	}
 	defer file.Close()
 
-	conn, err := net.DialTimeout("tcp", ip+":"+portTCP, 5*time.Second)
+	conn, err := net.DialTimeout("tcp", target+":"+portTCP, 3*time.Second)
 	if err != nil {
-		fmt.Println("Dial error:", err)
+		fmt.Println("Connection error:", err)
 		return
 	}
 	defer conn.Close()
 
-	// Get just the filename if a full path was provided
 	fInfo, _ := file.Stat()
 	fmt.Fprintf(conn, "FILE:%s\n", fInfo.Name())
 
-	respReader := bufio.NewReader(conn)
-	status, _ := respReader.ReadString('\n')
-	if !strings.Contains(status, "ACCEPTED") {
-		fmt.Println("File transfer rejected.")
-		return
+	reader := bufio.NewReader(conn)
+	status, _ := reader.ReadString('\n')
+	if strings.Contains(status, "ACCEPTED") {
+		io.Copy(conn, file)
+		fmt.Println("File sent successfully.")
+	} else {
+		fmt.Println("Peer rejected the file.")
 	}
-
-	io.Copy(conn, file)
-	fmt.Println("File sent successfully.")
 }
