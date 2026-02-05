@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -23,17 +24,30 @@ var (
 )
 
 func main() {
-	host, _ := os.Hostname()
-	fmt.Printf("Starting Peer: %s\n", host)
 
-	go listenForPeers(host)
-	go broadcastIdentity(host)
+	var name string
+	flag.StringVar(&name, "name", "", "A required name string argument")
+
+	flag.Parse()
+
+	if name == "" {
+		fmt.Fprintln(os.Stderr, "Error: --name=ABC is required")
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	fmt.Printf("Starting Peer: %s\n", name)
+
+	go listenForPeers(name)
+	go broadcastIdentity(name)
 	go startTCPServer()
 
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
 		fmt.Print("\n> ")
-		if !scanner.Scan() { break }
+		if !scanner.Scan() {
+			break
+		}
 		input := scanner.Text()
 
 		parts := strings.Split(input, " ")
@@ -127,7 +141,8 @@ func handleIncoming(conn net.Conn) {
 func startChatClient(ip string) {
 	conn, err := net.Dial("tcp", ip+":"+portTCP)
 	if err != nil {
-		fmt.Println("Error:", err); return
+		fmt.Println("Error:", err)
+		return
 	}
 	defer conn.Close()
 
@@ -149,7 +164,8 @@ func startChatClient(ip string) {
 func sendFile(ip string, path string) {
 	file, err := os.Open(path)
 	if err != nil {
-		fmt.Println("File error:", err); return
+		fmt.Println("File error:", err)
+		return
 	}
 	defer file.Close()
 
