@@ -31,6 +31,7 @@ type chatMsg struct{ sender, content string }
 type progressMsg float64
 
 type item struct{ title, desc string }
+
 func (i item) Title() string       { return i.title }
 func (i item) Description() string { return i.desc }
 func (i item) FilterValue() string { return i.title }
@@ -86,9 +87,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
+		
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "ctrl+c", "q": return m, tea.Quit
+		case "ctrl+c":
+			return m, tea.Quit
+		case "esc":
+			// This will always take you back to the Peer List (state 0)
+			m.state = 0
+			m.textInput.Blur() // Stop focusing the text box
+			return m, nil
 		case "f":
 			if m.state == 0 && m.list.SelectedItem() != nil {
 				m.selectedIP = m.list.SelectedItem().(item).desc
@@ -108,7 +116,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.viewport.GotoBottom()
 				return m, m.sendChatCmd(text)
 			}
-		case "esc": m.state = 0
+		case "q":
+			// Only quit on 'q' if we aren't currently in Chat Mode (state 3)
+			// or File Picker mode (state 1)
+			if m.state == 0 {
+				return m, tea.Quit
+			}
 		}
 
 	case peerUpdateMsg:
@@ -157,8 +170,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) View() string {
 	s := lipgloss.NewStyle().Margin(1, 2)
 	switch m.state {
-	case 1: return s.Render("Select File (Enter to select, Esc to go back):\n\n" + m.filepicker.View())
-	case 2: return s.Render(fmt.Sprintf("Sending to %s...\n\n%s", m.selectedIP, m.progress.View()))
+	case 1:
+		return s.Render("Select File (Enter to select, Esc to go back):\n\n" + m.filepicker.View())
+	case 2:
+		return s.Render(fmt.Sprintf("Sending to %s...\n\n%s", m.selectedIP, m.progress.View()))
 	case 3:
 		return s.Render(fmt.Sprintf("Chat with %s\n\n%s\n\n%s", m.selectedIP, m.viewport.View(), m.textInput.View()))
 	default:
@@ -171,7 +186,9 @@ func (m model) View() string {
 func (m model) sendChatCmd(text string) tea.Cmd {
 	return func() tea.Msg {
 		conn, err := net.DialTimeout("tcp", m.selectedIP+":"+portTCP, 2*time.Second)
-		if err != nil { return transferStatusMsg("Chat error: " + err.Error()) }
+		if err != nil {
+			return transferStatusMsg("Chat error: " + err.Error())
+		}
 		defer conn.Close()
 		fmt.Fprintf(conn, "CHAT:%s:%s\n", m.userName, text)
 		return nil
@@ -235,7 +252,9 @@ func listenUDP(myName string, netChan chan interface{}) {
 		msg := string(buf[:n])
 		if strings.HasPrefix(msg, "IAM:") {
 			pName := msg[4:]
-			if pName == myName { continue }
+			if pName == myName {
+				continue
+			}
 			if _, seen := discovered.LoadOrStore(rAddr.IP.String(), pName); !seen {
 				netChan <- peerUpdateMsg{name: pName, ip: rAddr.IP.String()}
 			}
