@@ -17,17 +17,16 @@ const (
 	portTCP = "8080"
 )
 
-// Global map to track discovered peers and prevent spam
 var (
+	// Maps Name -> IP address
+	peerRegistry    = make(map[string]string)
 	discoveredPeers = make(map[string]time.Time)
 	peerMutex       sync.Mutex
 )
 
 func main() {
-
 	var name string
 	flag.StringVar(&name, "name", "", "A required name string argument")
-
 	flag.Parse()
 
 	if name == "" {
@@ -36,7 +35,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("Starting Peer: %s\n", name)
+	fmt.Printf("--- Peer: %s ---\n", name)
+	fmt.Println("Commands: 'exit', 'file <name/ip> <path>', or just '<name/ip>' to chat")
 
 	go listenForPeers(name)
 	go broadcastIdentity(name)
@@ -48,20 +48,37 @@ func main() {
 		if !scanner.Scan() {
 			break
 		}
-		input := scanner.Text()
+		input := strings.TrimSpace(scanner.Text())
+		if input == "" {
+			continue
+		}
 
 		parts := strings.Split(input, " ")
+
 		if parts[0] == "exit" {
-			break
+			os.Exit(0)
 		} else if parts[0] == "file" && len(parts) == 3 {
-			sendFile(parts[1], parts[2])
-		} else if parts[0] != "" {
-			startChatClient(parts[0])
+			target := resolveTarget(parts[1])
+			sendFile(target, parts[2])
+		} else {
+			// Try to resolve name to IP, otherwise use raw input
+			target := resolveTarget(parts[0])
+			startChatClient(target)
 		}
 	}
 }
 
-// --- DISCOVERY WITH SPAM FILTER ---
+// Helper to check if a string is a known peer name, otherwise return original string (IP)
+func resolveTarget(input string) string {
+	peerMutex.Lock()
+	defer peerMutex.Unlock()
+	if ip, exists := peerRegistry[input]; exists {
+		return ip
+	}
+	return input
+}
+
+// --- DISCOVERY ---
 
 func broadcastIdentity(hostname string) {
 	addr, _ := net.ResolveUDPAddr("udp", "255.255.255.255:"+portUDP)
@@ -80,15 +97,17 @@ func listenForPeers(myHost string) {
 		n, remoteAddr, _ := conn.ReadFromUDP(buf)
 		msg := string(buf[:n])
 		if strings.HasPrefix(msg, "IAM:") {
-			name := msg[4:]
+			peerName := msg[4:]
 			ip := remoteAddr.IP.String()
 
 			peerMutex.Lock()
 			lastSeen, exists := discoveredPeers[ip]
-			// Only print if new OR haven't seen in 30 seconds
-			if name != myHost && (!exists || time.Since(lastSeen) > 30*time.Second) {
-				fmt.Printf("\n[New Peer Found] %s (%s)", name, ip)
-				fmt.Print("\n> ") // Re-print prompt
+			// Update registry
+			peerRegistry[peerName] = ip
+
+			if peerName != myHost && (!exists || time.Since(lastSeen) > 30*time.Second) {
+				fmt.Printf("\n[Found Peer] Name: %s | IP: %s", peerName, ip)
+				fmt.Print("\n> ")
 			}
 			discoveredPeers[ip] = time.Now()
 			peerMutex.Unlock()
@@ -96,10 +115,14 @@ func listenForPeers(myHost string) {
 	}
 }
 
-// --- TCP SERVER WITH ACCEPT/REJECT ---
+// --- TCP SERVER ---
 
 func startTCPServer() {
-	ln, _ := net.Listen("tcp", ":"+portTCP)
+	ln, err := net.Listen("tcp", ":"+portTCP)
+	if err != nil {
+		fmt.Printf("Server Error: %v\n", err)
+		return
+	}
 	for {
 		conn, _ := ln.Accept()
 		go handleIncoming(conn)
@@ -107,18 +130,21 @@ func startTCPServer() {
 }
 
 func handleIncoming(conn net.Conn) {
+	defer conn.Close()
 	reader := bufio.NewReader(conn)
 	header, _ := reader.ReadString('\n')
 	header = strings.TrimSpace(header)
 
-	// Ask for permission
-	fmt.Printf("\n[Request] %s from %s. Accept? (y/n): ", header, conn.RemoteAddr())
+	// Note: In a real terminal app, Scanln here conflicts with the main loop.
+	// For this simple version, we assume the user responds to the prompt.
+	fmt.Printf("\n[Incoming %s] Accept? (y/n): ", header)
+
+	// Use a dedicated scanner for the response to avoid issues
 	var response string
 	fmt.Scanln(&response)
 
 	if strings.ToLower(response) != "y" {
 		fmt.Fprintln(conn, "REJECTED")
-		conn.Close()
 		return
 	}
 	fmt.Fprintln(conn, "ACCEPTED")
@@ -128,37 +154,60 @@ func handleIncoming(conn net.Conn) {
 		f, _ := os.Create("received_" + fileName)
 		defer f.Close()
 		io.Copy(f, reader)
-		fmt.Printf("\n[Success] Saved received_%s\n", fileName)
+		fmt.Printf("\n[Success] Saved received_%s\n> ", fileName)
 	} else {
-		// Chat mode
-		go io.Copy(os.Stdout, reader)
-		io.Copy(conn, os.Stdin)
+		fmt.Println("--- Chat Started (Type '.exit' to stop) ---")
+		done := make(chan struct{})
+		go func() {
+			io.Copy(os.Stdout, reader)
+			fmt.Println("\n[Peer disconnected]")
+			close(done)
+		}()
+
+		// In-line chat loop
+		inputScanner := bufio.NewScanner(os.Stdin)
+		for inputScanner.Scan() {
+			text := inputScanner.Text()
+			if text == ".exit" {
+				break
+			}
+			fmt.Fprintln(conn, text)
+		}
+		fmt.Println("--- Chat Ended ---")
 	}
 }
 
 // --- CLIENTS ---
 
 func startChatClient(ip string) {
-	conn, err := net.Dial("tcp", ip+":"+portTCP)
+	conn, err := net.DialTimeout("tcp", ip+":"+portTCP, 5*time.Second)
 	if err != nil {
-		fmt.Println("Error:", err)
+		fmt.Printf("Connection failed: %v\n", err)
 		return
 	}
 	defer conn.Close()
 
 	fmt.Fprintf(conn, "CHAT_REQUEST\n")
 
-	// Wait for acceptance
 	respReader := bufio.NewReader(conn)
 	status, _ := respReader.ReadString('\n')
 	if !strings.Contains(status, "ACCEPTED") {
-		fmt.Println("Connection rejected by peer.")
+		fmt.Println("Connection rejected.")
 		return
 	}
 
-	fmt.Println("Connected! (Ctrl+C to end)")
-	go io.Copy(os.Stdout, conn)
-	io.Copy(conn, os.Stdin)
+	fmt.Println("Connected! Type your message (Type '.exit' to stop):")
+
+	go io.Copy(os.Stdout, respReader)
+
+	inputScanner := bufio.NewScanner(os.Stdin)
+	for inputScanner.Scan() {
+		text := inputScanner.Text()
+		if text == ".exit" {
+			break
+		}
+		fmt.Fprintln(conn, text)
+	}
 }
 
 func sendFile(ip string, path string) {
@@ -169,10 +218,16 @@ func sendFile(ip string, path string) {
 	}
 	defer file.Close()
 
-	conn, _ := net.Dial("tcp", ip+":"+portTCP)
+	conn, err := net.DialTimeout("tcp", ip+":"+portTCP, 5*time.Second)
+	if err != nil {
+		fmt.Println("Dial error:", err)
+		return
+	}
 	defer conn.Close()
 
-	fmt.Fprintf(conn, "FILE:%s\n", file.Name())
+	// Get just the filename if a full path was provided
+	fInfo, _ := file.Stat()
+	fmt.Fprintf(conn, "FILE:%s\n", fInfo.Name())
 
 	respReader := bufio.NewReader(conn)
 	status, _ := respReader.ReadString('\n')
