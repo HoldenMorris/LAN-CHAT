@@ -2,6 +2,14 @@ package main
 
 import (
 	"bufio"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
+	"encoding/hex"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -41,18 +49,74 @@ func logToFile(s string) {
 	}
 }
 
+// --- Crypto ---
+
+func deriveKey(password string) []byte {
+	h := sha256.Sum256([]byte(password))
+	return h[:]
+}
+
+func encryptData(plaintext []byte, password string) (string, error) {
+	block, err := aes.NewCipher(deriveKey(password))
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", err
+	}
+	ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
+	return base64.StdEncoding.EncodeToString(ciphertext), nil
+}
+
+func decryptData(encoded string, password string) ([]byte, error) {
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, err
+	}
+	block, err := aes.NewCipher(deriveKey(password))
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonceSize := gcm.NonceSize()
+	if len(data) < nonceSize {
+		return nil, fmt.Errorf("ciphertext too short")
+	}
+	return gcm.Open(nil, data[:nonceSize], data[nonceSize:], nil)
+}
+
+func passwordFingerprint(password string) string {
+	h := sha256.Sum256([]byte("LAN-CHAT-VERIFY:" + password))
+	return hex.EncodeToString(h[:])
+}
+
 // --- Messages ---
 type peerUpdateMsg struct{ name, ip, lastMsg string }
 type transferStatusMsg string
 type chatMsg struct{ sender, content string }
 type progressMsg float64
+type peerVerifiedMsg struct{ ip string; secure bool }
 
 // item implements list.Item
 type item struct {
 	title, desc, lastMsg string
+	secure               bool
 }
 
-func (i item) Title() string       { return i.title }
+func (i item) Title() string {
+	if i.secure {
+		return "\U0001F512 " + i.title
+	}
+	return i.title
+}
 func (i item) Description() string { return i.desc + " | " + i.lastMsg }
 func (i item) FilterValue() string { return i.title }
 
@@ -72,9 +136,12 @@ type model struct {
 	userName    string
 	width       int
 	height      int
+	password    string
+	passHash    string
+	securePeers map[string]bool
 }
 
-func initialModel(name string, netChan chan interface{}) model {
+func initialModel(name string, password string, netChan chan interface{}) model {
 	l := list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0)
 	l.Title = "xYou are: " + name + " | (/) Filter (f) File (enter) Chat (esc) Quit"
 
@@ -91,6 +158,11 @@ func initialModel(name string, netChan chan interface{}) model {
 	ti.Placeholder = "Type a message..."
 	// Don't focus by default, only focus when in chat mode
 
+	var ph string
+	if password != "" {
+		ph = passwordFingerprint(password)
+	}
+
 	return model{
 		state:       0,
 		list:        l,
@@ -99,6 +171,9 @@ func initialModel(name string, netChan chan interface{}) model {
 		textInput:   ti,
 		networkChan: netChan,
 		userName:    name,
+		password:    password,
+		passHash:    ph,
+		securePeers: make(map[string]bool),
 	}
 }
 
@@ -186,6 +261,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if !found {
 			m.list.InsertItem(0, item{title: msg.name, desc: msg.ip, lastMsg: "New connection"})
+		}
+		return m, waitForNetwork(m.networkChan)
+
+	case peerVerifiedMsg:
+		m.securePeers[msg.ip] = msg.secure
+		items := m.list.Items()
+		for i, itm := range items {
+			p := itm.(item)
+			if p.desc == msg.ip {
+				p.secure = msg.secure
+				m.list.SetItem(i, p)
+				break
+			}
 		}
 		return m, waitForNetwork(m.networkChan)
 
@@ -381,7 +469,11 @@ func (m model) View() string {
 		
 		return containerStyle.Render(lipgloss.JoinVertical(lipgloss.Left, title, content, footer))
 	case 2:
-		title := borderStyle.Render(fmt.Sprintf("Sending to %s (%s)...", m.selectedName, m.selectedIP))
+		secureLabel := ""
+		if m.password != "" && m.securePeers[m.selectedIP] {
+			secureLabel = " \U0001F512 Encrypted"
+		}
+		title := borderStyle.Render(fmt.Sprintf("Sending to %s (%s)%s...", m.selectedName, m.selectedIP, secureLabel))
 		
 		// Custom footer for progress
 		// No specific interactions usually, but maybe Quit?
@@ -392,7 +484,11 @@ func (m model) View() string {
 		
 		return containerStyle.Render(lipgloss.JoinVertical(lipgloss.Left, title, content, footer))
 	case 3:
-		title := borderStyle.Render(fmt.Sprintf("Chat with %s (%s)", m.selectedName, m.selectedIP))
+		chatSecure := ""
+		if m.password != "" && m.securePeers[m.selectedIP] {
+			chatSecure = " \U0001F512 Encrypted"
+		}
+		title := borderStyle.Render(fmt.Sprintf("Chat with %s (%s)%s", m.selectedName, m.selectedIP, chatSecure))
 		
 		// Custom footer for chat
 		footer := m.customBorderFooter(m.width, "(esc) Back")
@@ -441,7 +537,11 @@ func (m model) View() string {
 			titleText = "Filter"
 			footerText = "(enter) Apply | (esc) Cancel"
 		} else {
-			titleText = fmt.Sprintf("You are: %s", m.userName)
+			if m.password != "" {
+				titleText = fmt.Sprintf("You are: %s \U0001F512", m.userName)
+			} else {
+				titleText = fmt.Sprintf("You are: %s", m.userName)
+			}
 			footerText = "(/) Filter | (f) File (enter) Chat | (esc) Quit"
 		}
 		
@@ -461,6 +561,22 @@ func (m model) View() string {
 
 // --- Networking ---
 
+func verifyPeer(peerIP string, passHash string, netChan chan interface{}) {
+	conn, err := net.DialTimeout("tcp", peerIP+":"+portTCP, 2*time.Second)
+	if err != nil {
+		netChan <- peerVerifiedMsg{ip: peerIP, secure: false}
+		return
+	}
+	defer conn.Close()
+	fmt.Fprintf(conn, "VERIFY:%s\n", passHash)
+	resp, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		netChan <- peerVerifiedMsg{ip: peerIP, secure: false}
+		return
+	}
+	netChan <- peerVerifiedMsg{ip: peerIP, secure: strings.TrimSpace(resp) == "VMATCH"}
+}
+
 func (m model) sendChatCmd(text string) tea.Cmd {
 	return func() tea.Msg {
 		conn, err := net.DialTimeout("tcp", m.selectedIP+":"+portTCP, 2*time.Second)
@@ -468,7 +584,15 @@ func (m model) sendChatCmd(text string) tea.Cmd {
 			return transferStatusMsg("Chat error: " + err.Error())
 		}
 		defer conn.Close()
-		fmt.Fprintf(conn, "CHAT:%s:%s\n", m.userName, text)
+		if m.password != "" && m.securePeers[m.selectedIP] {
+			encrypted, err := encryptData([]byte(text), m.password)
+			if err != nil {
+				return transferStatusMsg("Encryption error: " + err.Error())
+			}
+			fmt.Fprintf(conn, "ECHAT:%s:%s\n", m.userName, encrypted)
+		} else {
+			fmt.Fprintf(conn, "CHAT:%s:%s\n", m.userName, text)
+		}
 		return nil
 	}
 }
@@ -480,14 +604,23 @@ func (m model) sendFileCmd(path string) tea.Cmd {
 		fInfo, _ := file.Stat()
 		conn, _ := net.Dial("tcp", m.selectedIP+":"+portTCP)
 		defer conn.Close()
-		fmt.Fprintf(conn, "FILE:%s\n", fInfo.Name())
-		bufio.NewReader(conn).ReadString('\n')
-		io.Copy(conn, file)
+		if m.password != "" && m.securePeers[m.selectedIP] {
+			fmt.Fprintf(conn, "EFILE:%s\n", fInfo.Name())
+			bufio.NewReader(conn).ReadString('\n') // wait for ACCEPTED
+			// Load file into memory for encryption (acceptable for LAN-sized files)
+			content, _ := io.ReadAll(file)
+			encrypted, _ := encryptData(content, m.password)
+			conn.Write([]byte(encrypted))
+		} else {
+			fmt.Fprintf(conn, "FILE:%s\n", fInfo.Name())
+			bufio.NewReader(conn).ReadString('\n')
+			io.Copy(conn, file)
+		}
 		return transferStatusMsg("Sent: " + fInfo.Name())
 	}
 }
 
-func startTCPServer(netChan chan interface{}) {
+func startTCPServer(netChan chan interface{}, password string, passHash string) {
 	ln, err := net.Listen("tcp", ":"+portTCP)
 	if err != nil {
 		netChan <- transferStatusMsg("TCP listen error: " + err.Error())
@@ -504,11 +637,52 @@ func startTCPServer(netChan chan interface{}) {
 				name := strings.TrimSpace(strings.TrimPrefix(header, "FILE:"))
 				f, _ := os.Create("received_" + name)
 				io.Copy(f, reader)
+				f.Close()
 				netChan <- transferStatusMsg("Received: " + name)
+			} else if strings.HasPrefix(header, "EFILE:") {
+				fmt.Fprintln(c, "ACCEPTED")
+				name := strings.TrimSpace(strings.TrimPrefix(header, "EFILE:"))
+				encoded, _ := io.ReadAll(reader)
+				if password != "" {
+					plaintext, err := decryptData(string(encoded), password)
+					if err != nil {
+						netChan <- transferStatusMsg("Failed to decrypt file: " + name)
+					} else {
+						f, _ := os.Create("received_" + name)
+						f.Write(plaintext)
+						f.Close()
+						netChan <- transferStatusMsg("Received (encrypted): " + name)
+					}
+				} else {
+					netChan <- transferStatusMsg("Encrypted file received but no password set: " + name)
+				}
 			} else if strings.HasPrefix(header, "CHAT:") {
 				parts := strings.SplitN(header[5:], ":", 2)
 				if len(parts) == 2 {
 					netChan <- chatMsg{sender: parts[0], content: strings.TrimSpace(parts[1])}
+				}
+			} else if strings.HasPrefix(header, "ECHAT:") {
+				parts := strings.SplitN(header[6:], ":", 2)
+				if len(parts) == 2 {
+					sender := parts[0]
+					payload := strings.TrimSpace(parts[1])
+					if password != "" {
+						plaintext, err := decryptData(payload, password)
+						if err != nil {
+							netChan <- chatMsg{sender: sender, content: "[Could not decrypt - password mismatch]"}
+						} else {
+							netChan <- chatMsg{sender: sender, content: string(plaintext)}
+						}
+					} else {
+						netChan <- chatMsg{sender: sender, content: "[Encrypted message - no password set]"}
+					}
+				}
+			} else if strings.HasPrefix(header, "VERIFY:") {
+				remoteHash := strings.TrimSpace(strings.TrimPrefix(header, "VERIFY:"))
+				if passHash != "" && subtle.ConstantTimeCompare([]byte(remoteHash), []byte(passHash)) == 1 {
+					fmt.Fprintln(c, "VMATCH")
+				} else {
+					fmt.Fprintln(c, "VNOMATCH")
 				}
 			}
 		}(conn)
@@ -527,7 +701,7 @@ func broadcast(name string) {
 	}
 }
 
-func listenUDP(myName string, netChan chan interface{}) {
+func listenUDP(myName string, passHash string, netChan chan interface{}) {
 	addr, _ := net.ResolveUDPAddr("udp", ":"+portUDP)
 	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
@@ -546,17 +720,31 @@ func listenUDP(myName string, netChan chan interface{}) {
 			}
 			if _, seen := discovered.LoadOrStore(rAddr.IP.String(), pName); !seen {
 				netChan <- peerUpdateMsg{name: pName, ip: rAddr.IP.String(), lastMsg: "Connected"}
+				if passHash != "" {
+					go verifyPeer(rAddr.IP.String(), passHash, netChan)
+				}
 			}
 		}
 	}
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("Usage: go run main.go <yourname>")
+	password := flag.String("pass", "", "Shared password for encrypted communication")
+	flag.Parse()
+
+	args := flag.Args()
+	if len(args) < 1 {
+		fmt.Println("Usage: lan-chat [--pass=PASSWORD] <yourname>")
+		flag.PrintDefaults()
 		return
 	}
-	name := os.Args[1]
+	name := args[0]
+	pass := *password
+
+	var passHash string
+	if pass != "" {
+		passHash = passwordFingerprint(pass)
+	}
 
 	if enableDebug {
 		logFile, err := os.OpenFile("debug.log", os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
@@ -568,12 +756,12 @@ func main() {
 
 	netChan := make(chan interface{})
 	go broadcast(name)
-	go listenUDP(name, netChan)
-	go startTCPServer(netChan)
+	go listenUDP(name, passHash, netChan)
+	go startTCPServer(netChan, pass, passHash)
 
 	programOpts := []tea.ProgramOption{tea.WithAltScreen()}
 
-	p := tea.NewProgram(initialModel(name, netChan), programOpts...)
+	p := tea.NewProgram(initialModel(name, pass, netChan), programOpts...)
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error: %v", err)
 	}
