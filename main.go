@@ -64,8 +64,9 @@ type model struct {
 	progress    progress.Model
 	textInput   textinput.Model
 	viewport    viewport.Model
-	selectedIP  string
-	lastStatus  string
+	selectedIP   string
+	selectedName string
+	lastStatus   string
 	chatHistory []string
 	networkChan chan interface{}
 	userName    string
@@ -140,7 +141,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "f":
 			if m.state == 0 && m.list.SelectedItem() != nil {
-				m.selectedIP = m.list.SelectedItem().(item).desc
+				item := m.list.SelectedItem().(item)
+				m.selectedIP = item.desc
+				m.selectedName = item.title
 				m.state = 1
 				return m, m.filepicker.Init()
 			}
@@ -152,7 +155,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 			if m.state == 0 && m.list.SelectedItem() != nil {
-				m.selectedIP = m.list.SelectedItem().(item).desc
+				item := m.list.SelectedItem().(item)
+				m.selectedIP = item.desc
+				m.selectedName = item.title
 				m.state = 3
 				m.textInput.Focus() // Focus input when entering chat mode
 				return m, nil
@@ -299,11 +304,11 @@ func (m model) View() string {
 		content := filePickerStyle.Render(m.filepicker.View())
 		return containerStyle.Render(lipgloss.JoinVertical(lipgloss.Left, title, content))
 	case 2:
-		title := borderStyle.Render(fmt.Sprintf("Sending to %s...", m.selectedIP))
+		title := borderStyle.Render(fmt.Sprintf("Sending to %s (%s)...", m.selectedName, m.selectedIP))
 		content := progressStyle.Render(m.progress.View())
 		return containerStyle.Render(lipgloss.JoinVertical(lipgloss.Left, title, content))
 	case 3:
-		title := borderStyle.Render(fmt.Sprintf("Chat with %s (Esc to go back)", m.selectedIP))
+		title := borderStyle.Render(fmt.Sprintf("Chat with %s (%s) (Esc to go back)", m.selectedName, m.selectedIP))
 		// Viewport is already sized in Update/resizeComponents
 		viewport := chatViewportStyle.Render(m.viewport.View())
 		input := inputStyle.Render(m.textInput.View())
