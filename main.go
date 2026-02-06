@@ -260,13 +260,43 @@ func (m *model) resizeComponents(width, height int) {
 	// Chat View
 	// Title: 3 lines (1 text + 2 border)
 	// Input: 3 lines (1 text + 2 border)
-	// Viewport: Remaining height = Height - 6 - 2 (viewport border) = Height - 8
-
-	viewportHeight := height - 8
-	if viewportHeight < 0 {
-		viewportHeight = 0
-	}
-
+	// Viewport: Remaining height = Height - 6 - 1 (footer border only) = Height - 7
+	// Wait, we have footer now which is 1 line.
+	// Total height = Height.
+	// Used by: Title (3), Input (3), Footer (1).
+	// Remaining for Viewport = Height - 7.
+	// Viewport has borders (2).
+	// Content height inside viewport = Height - 7 - 2 = Height - 9.
+	
+	// User reported it's 3 lines too short.
+	// Let's re-evaluate.
+	// Total Available: Height
+	// Layout:
+	// - Title Box (Height 3: 1 line text + 2 border lines)
+	// - Viewport Box (Height X)
+	// - Input Box (Height 3: 1 line text + 2 border lines)
+	// - Footer (Height 1)
+	
+	// The View() function joins these with JoinVertical.
+	// JoinVertical simply stacks strings.
+	// If borders overlap (collapsing borders), height calculation is different.
+	// Currently, they do NOT overlap/collapse automatically with standard styles unless handled specifically.
+	// We are just returning Render() output strings.
+	
+	// Total Height Used = 3 (Title) + X (Viewport) + 3 (Input) + 1 (Footer) = 7 + X
+	// So X (Viewport Height INCLUDING borders) = Height - 7
+	
+	// Viewport Content Height = X - 2 (borders) = (Height - 7) - 2 = Height - 9
+	
+	// If it is 3 lines too short, maybe the border calculation is wrong or margins?
+	// lipgloss.JoinVertical adds newlines? No.
+	
+	// Let's try increasing viewport height by 3 as requested to see if it fits.
+	// Previous: Height - 9. New: Height - 6.
+	
+	viewportHeight := height - 6
+	if viewportHeight < 0 { viewportHeight = 0 }
+	
 	// Recreate viewport if size changed or init
 	m.viewport = viewport.New(contentWidth, viewportHeight)
 	m.viewport.SetContent(strings.Join(m.chatHistory, "\n"))
@@ -279,13 +309,56 @@ func (m *model) resizeComponents(width, height int) {
 	m.textInput.Width = contentWidth
 }
 
+func (m model) customBorderFooter(width int, text string) string {
+	// Colors
+	textColor := lipgloss.Color("240") // Light gray
+	borderStyle := lipgloss.NewStyle() // Default border color
+	textStyle := lipgloss.NewStyle().Foreground(textColor)
+
+	cornerLeft := "╰"
+	cornerRight := "╯"
+	horiz := "─"
+
+	// Text formatting
+	displayQuery := fmt.Sprintf("[ %s ]", text)
+	textLen := len(displayQuery)
+
+	// Calculate dashes
+	// Total width available for dashes = width - 2 (corners) - textLen
+	// Align right-ish: Give 2 dashes padding on right if possible
+	availableSpace := width - 2 - textLen
+	if availableSpace < 0 {
+		availableSpace = 0
+	}
+
+	rightDashes := 2
+	leftDashes := availableSpace - rightDashes
+
+	if leftDashes < 0 {
+		leftDashes = 0
+		rightDashes = availableSpace
+	}
+
+	line := borderStyle.Render(cornerLeft) +
+		borderStyle.Render(strings.Repeat(horiz, leftDashes)) +
+		textStyle.Render(displayQuery) +
+		borderStyle.Render(strings.Repeat(horiz, rightDashes)) +
+		borderStyle.Render(cornerRight)
+
+	return line
+}
+
 func (m model) View() string {
 	// Define border styles with minimal padding
 	// Force the width to be full width minus borders (2)
 	// We want all boxes to be full width
 	fullWidthStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1).Width(m.width - 2)
 
-	listStyle := fullWidthStyle
+	listStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder(), true, true, false, true).
+		Padding(0, 1).
+		Width(m.width - 2)
+		
 	borderStyle := fullWidthStyle // Used for titles
 	filePickerStyle := fullWidthStyle
 	progressStyle := fullWidthStyle
@@ -297,39 +370,92 @@ func (m model) View() string {
 
 	switch m.state {
 	case 1:
-		title := borderStyle.Render("Select File (Enter to select, Esc to go back)")
-		// Filepicker content needs to be rendered inside the style
-		// Wait, if we wrap filepicker in a style, does it respect the width?
-		// Filepicker View returns a string.
-		content := filePickerStyle.Render(m.filepicker.View())
-		return containerStyle.Render(lipgloss.JoinVertical(lipgloss.Left, title, content))
+		title := borderStyle.Render("Select File")
+		
+		// Custom footer for filepicker
+		footer := m.customBorderFooter(m.width, "(enter) Select | (esc) Back")
+		
+		// Adjust content style to remove bottom border so footer attaches correctly
+		contentStyle := filePickerStyle.Copy().Border(lipgloss.RoundedBorder(), true, true, false, true)
+		content := contentStyle.Render(m.filepicker.View())
+		
+		return containerStyle.Render(lipgloss.JoinVertical(lipgloss.Left, title, content, footer))
 	case 2:
 		title := borderStyle.Render(fmt.Sprintf("Sending to %s (%s)...", m.selectedName, m.selectedIP))
-		content := progressStyle.Render(m.progress.View())
-		return containerStyle.Render(lipgloss.JoinVertical(lipgloss.Left, title, content))
+		
+		// Custom footer for progress
+		// No specific interactions usually, but maybe Quit?
+		footer := m.customBorderFooter(m.width, "")
+		
+		contentStyle := progressStyle.Copy().Border(lipgloss.RoundedBorder(), true, true, false, true)
+		content := contentStyle.Render(m.progress.View())
+		
+		return containerStyle.Render(lipgloss.JoinVertical(lipgloss.Left, title, content, footer))
 	case 3:
-		title := borderStyle.Render(fmt.Sprintf("Chat with %s (%s) (Esc to go back)", m.selectedName, m.selectedIP))
-		// Viewport is already sized in Update/resizeComponents
-		viewport := chatViewportStyle.Render(m.viewport.View())
+		title := borderStyle.Render(fmt.Sprintf("Chat with %s (%s)", m.selectedName, m.selectedIP))
+		
+		// Custom footer for chat
+		footer := m.customBorderFooter(m.width, "(esc) Back")
+		
+		// Adjust viewport and input borders.
+		// Viewport needs top, left, right. Input needs left, right. Footer has bottom.
+		// Wait, viewport is on top of input.
+		// Structure: Title (top border) -> Viewport (side borders) -> Input (side borders) -> Footer (bottom border)
+		
+		// Title already has full border. We should probably remove bottom border from Title?
+		// No, standard Bubble Tea list usually keeps title separated.
+		// Let's stick to the pattern: Title Box + Content Box + Footer.
+		// But Chat has two components (Viewport + Input).
+		// Let's wrap them in a container that has side borders?
+		
+		// Current design:
+		// Title (Border)
+		// Viewport (Border)
+		// Input (Border)
+		
+		// New design requested:
+		// Title (Border)
+		// Viewport + Input (merged or separate?)
+		// Footer (Border with text)
+		
+		// If we follow the list pattern:
+		// Top: Title
+		// Middle: Content (Viewport + Input)
+		// Bottom: Footer
+		
+		// Let's try to make Input look like the bottom part of the content.
+		
+		vpStyle := chatViewportStyle.Copy().Border(lipgloss.RoundedBorder(), true, true, false, true)
+		inputStyle := inputStyle.Copy().Border(lipgloss.RoundedBorder(), false, true, false, true)
+		
+		viewport := vpStyle.Render(m.viewport.View())
 		input := inputStyle.Render(m.textInput.View())
-		// Join with minimal spacing
-		return containerStyle.Render(lipgloss.JoinVertical(lipgloss.Left, title, viewport, input))
+		
+		return containerStyle.Render(lipgloss.JoinVertical(lipgloss.Left, title, viewport, input, footer))
 	default:
 		// Custom rendering for list to support "connected peers" text
 		var titleText string
+		var footerText string
+		
 		if m.list.FilterState() == list.Filtering {
-			titleText = "Filter: Press (enter) to apply, (esc) to cancel"
+			titleText = "Filter"
+			footerText = "(enter) Apply | (esc) Cancel"
 		} else {
-			titleText = fmt.Sprintf("You are: %s | (/) Filter (f) File (enter) Chat (esc) Quit", m.userName)
+			titleText = fmt.Sprintf("You are: %s", m.userName)
+			footerText = "(/) Filter | (f) File (enter) Chat | (esc) Quit"
 		}
-
+		
 		title := borderStyle.Render(titleText)
 		listView := m.list.View()
-
+		
 		// Wrap list in style to match other components
 		content := listStyle.Render(listView)
-
-		return containerStyle.Render(lipgloss.JoinVertical(lipgloss.Left, title, content))
+		
+		// Render custom footer
+		footer := m.customBorderFooter(m.width, footerText)
+		
+		// Join all parts
+		return containerStyle.Render(lipgloss.JoinVertical(lipgloss.Left, title, content, footer))
 	}
 }
 
