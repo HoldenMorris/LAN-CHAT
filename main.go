@@ -21,8 +21,8 @@ import (
 )
 
 const (
-	portUDP = "9999"
-	portTCP = "8080"
+	portUDP     = "9999"
+	portTCP     = "8080"
 	enableDebug = true // Set to false to disable debugging
 )
 
@@ -69,14 +69,19 @@ type model struct {
 	chatHistory []string
 	networkChan chan interface{}
 	userName    string
+	width       int
+	height      int
 }
 
 func initialModel(name string, netChan chan interface{}) model {
 	l := list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0)
-	l.Title = "You are: " + name + " | (f) File (enter) Chat (esc) Back/Quit"
+	l.Title = "xYou are: " + name + " | (/) Filter (f) File (enter) Chat (esc) Quit"
 
 	// Remove 'q' from the help menu
 	l.KeyMap.Quit.SetKeys()
+	l.SetShowStatusBar(false)
+	l.SetShowHelp(false)  // Hide default help view since we render it manually
+	l.SetShowTitle(false) // Hide default title since we render it manually
 
 	fp := filepicker.New()
 	fp.CurrentDirectory, _ = os.Getwd()
@@ -140,6 +145,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.filepicker.Init()
 			}
 		case "enter":
+			// If filtering, let the list handle Enter to stop filtering.
+			// Do NOT switch to chat mode in this case.
+			if m.state == 0 && m.list.FilterState() == list.Filtering {
+				break
+			}
+
 			if m.state == 0 && m.list.SelectedItem() != nil {
 				m.selectedIP = m.list.SelectedItem().(item).desc
 				m.state = 3
@@ -193,17 +204,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.WindowSizeMsg:
 		debugLog("WindowSize: %dx%d", msg.Width, msg.Height)
-		// Maximize component sizes accounting for borders and minimal margins
-		listWidth := msg.Width - 4  // 2 for margins, 2 for borders
-		listHeight := msg.Height - 6  // 2 for margins, 2 for borders, 2 for status
-		m.list.SetSize(listWidth, listHeight)
-		m.filepicker.Height = msg.Height - 8
-		m.progress.Width = msg.Width - 8
-		// For chat: split height between viewport and input
-		viewportHeight := msg.Height - 10  // Leave space for title, input, margins
-		m.viewport = viewport.New(msg.Width-4, viewportHeight)
-		debugLog("Component sizes: list=%dx%d, viewport=%dx%d", 
-			listWidth, listHeight, msg.Width-4, viewportHeight)
+		m.width = msg.Width
+		m.height = msg.Height
+		m.resizeComponents(msg.Width, msg.Height)
 	}
 
 	if m.state == 1 {
@@ -225,41 +228,103 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
+func (m *model) resizeComponents(width, height int) {
+	// Common width accounting for borders (2) and padding (2)
+	// We want the outer frame to be full width.
+	// The content width inside a bordered style with padding(0,1) is width - 2 (border) - 2 (padding) = width - 4.
+	contentWidth := width - 4
+
+	// List View
+	m.list.SetSize(contentWidth, height-5) // -2 borders (wrapper) -3 custom title
+
+	// File Picker View
+	// Title takes ~3 lines (including borders). Height of content area = Height - 3 (title) - 2 (content border) = Height - 5.
+	// Wait, title has borders (2) + text (1) = 3 lines.
+	// Content has borders (2) + padding(0) + text.
+	// Total height = Height.
+	// Available height for filepicker content = Height - 3 (title) - 2 (content border).
+	fpHeight := height - 6 // Reduced by 1 to prevent overflow
+	if fpHeight < 0 {
+		fpHeight = 0
+	}
+	m.filepicker.Height = fpHeight
+
+	// Progress View
+	m.progress.Width = contentWidth
+
+	// Chat View
+	// Title: 3 lines (1 text + 2 border)
+	// Input: 3 lines (1 text + 2 border)
+	// Viewport: Remaining height = Height - 6 - 2 (viewport border) = Height - 8
+
+	viewportHeight := height - 8
+	if viewportHeight < 0 {
+		viewportHeight = 0
+	}
+
+	// Recreate viewport if size changed or init
+	m.viewport = viewport.New(contentWidth, viewportHeight)
+	m.viewport.SetContent(strings.Join(m.chatHistory, "\n"))
+	m.viewport.GotoBottom()
+
+	// Input width
+	// TextInput width is the number of characters.
+	// We have a border around it. Padding is (0,1).
+	// So visible width is contentWidth.
+	m.textInput.Width = contentWidth
+}
+
 func (m model) View() string {
-	debugLog("View: state=%d, listItems=%d, viewportSize=%dx%d", 
-		m.state, len(m.list.Items()), m.viewport.Width, m.viewport.Height)
-	
 	// Define border styles with minimal padding
-	borderStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
-	filePickerStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
-	progressStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
-	chatViewportStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
-	inputStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
-	listStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
-	statusStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Border(lipgloss.RoundedBorder()).Padding(0, 1)
+	// Force the width to be full width minus borders (2)
+	// We want all boxes to be full width
+	fullWidthStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1).Width(m.width - 2)
+
+	listStyle := fullWidthStyle
+	borderStyle := fullWidthStyle // Used for titles
+	filePickerStyle := fullWidthStyle
+	progressStyle := fullWidthStyle
+	chatViewportStyle := fullWidthStyle
+	inputStyle := fullWidthStyle
 
 	// Minimal margins to maximize space
-	containerStyle := lipgloss.NewStyle().Margin(0, 1)
+	containerStyle := lipgloss.NewStyle().Margin(0, 0)
 
 	switch m.state {
 	case 1:
 		title := borderStyle.Render("Select File (Enter to select, Esc to go back)")
+		// Filepicker content needs to be rendered inside the style
+		// Wait, if we wrap filepicker in a style, does it respect the width?
+		// Filepicker View returns a string.
 		content := filePickerStyle.Render(m.filepicker.View())
-		return containerStyle.Render(title + "\n" + content)
+		return containerStyle.Render(lipgloss.JoinVertical(lipgloss.Left, title, content))
 	case 2:
 		title := borderStyle.Render(fmt.Sprintf("Sending to %s...", m.selectedIP))
 		content := progressStyle.Render(m.progress.View())
-		return containerStyle.Render(title + "\n" + content)
+		return containerStyle.Render(lipgloss.JoinVertical(lipgloss.Left, title, content))
 	case 3:
 		title := borderStyle.Render(fmt.Sprintf("Chat with %s (Esc to go back)", m.selectedIP))
+		// Viewport is already sized in Update/resizeComponents
 		viewport := chatViewportStyle.Render(m.viewport.View())
 		input := inputStyle.Render(m.textInput.View())
 		// Join with minimal spacing
 		return containerStyle.Render(lipgloss.JoinVertical(lipgloss.Left, title, viewport, input))
 	default:
-		list := listStyle.Render(m.list.View())
-		status := statusStyle.Render(m.lastStatus)
-		return containerStyle.Render(lipgloss.JoinVertical(lipgloss.Left, list, status))
+		// Custom rendering for list to support "connected peers" text
+		var titleText string
+		if m.list.FilterState() == list.Filtering {
+			titleText = "Filter: Press (enter) to apply, (esc) to cancel"
+		} else {
+			titleText = fmt.Sprintf("You are: %s | (/) Filter (f) File (enter) Chat (esc) Quit", m.userName)
+		}
+
+		title := borderStyle.Render(titleText)
+		listView := m.list.View()
+
+		// Wrap list in style to match other components
+		content := listStyle.Render(listView)
+
+		return containerStyle.Render(lipgloss.JoinVertical(lipgloss.Left, title, content))
 	}
 }
 
@@ -361,7 +426,7 @@ func main() {
 		return
 	}
 	name := os.Args[1]
-	
+
 	if enableDebug {
 		logFile, err := os.OpenFile("debug.log", os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
 		if err == nil {
@@ -369,14 +434,14 @@ func main() {
 			debugLog("Starting LAN-CHAT for user: %s", name)
 		}
 	}
-	
+
 	netChan := make(chan interface{})
 	go broadcast(name)
 	go listenUDP(name, netChan)
 	go startTCPServer(netChan)
 
 	programOpts := []tea.ProgramOption{tea.WithAltScreen()}
-	
+
 	p := tea.NewProgram(initialModel(name, netChan), programOpts...)
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error: %v", err)
