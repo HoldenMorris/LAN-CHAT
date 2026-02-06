@@ -117,7 +117,12 @@ func (i item) Title() string {
 	}
 	return i.title
 }
-func (i item) Description() string { return i.desc + " | " + i.lastMsg }
+func (i item) Description() string {
+	if i.secure {
+		return i.desc + " | \U0001F512 Encrypted | " + i.lastMsg
+	}
+	return i.desc + " | " + i.lastMsg
+}
 func (i item) FilterValue() string { return i.title }
 
 // --- Model ---
@@ -187,7 +192,10 @@ func waitForNetwork(ch chan interface{}) tea.Cmd {
 
 // --- Update ---
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	debugLog("Update: state=%d, msg=%T", m.state, msg)
+	msgType := fmt.Sprintf("%T", msg)
+	if msgType != "cursor.BlinkMsg" {
+		debugLog("Update: state=%d, msg=%s", m.state, msgType)
+	}
 	var cmd tea.Cmd
 	var cmds []tea.Cmd
 
@@ -265,6 +273,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, waitForNetwork(m.networkChan)
 
 	case peerVerifiedMsg:
+		debugLog("Peer verification: ip=%s secure=%v", msg.ip, msg.secure)
 		m.securePeers[msg.ip] = msg.secure
 		items := m.list.Items()
 		for i, itm := range items {
@@ -538,7 +547,7 @@ func (m model) View() string {
 			footerText = "(enter) Apply | (esc) Cancel"
 		} else {
 			if m.password != "" {
-				titleText = fmt.Sprintf("You are: %s \U0001F512", m.userName)
+				titleText = fmt.Sprintf("You are: %s (Encrypted) \U0001F512", m.userName)
 			} else {
 				titleText = fmt.Sprintf("You are: %s", m.userName)
 			}
@@ -562,8 +571,10 @@ func (m model) View() string {
 // --- Networking ---
 
 func verifyPeer(peerIP string, passHash string, netChan chan interface{}) {
+	debugLog("Verifying peer %s...", peerIP)
 	conn, err := net.DialTimeout("tcp", peerIP+":"+portTCP, 2*time.Second)
 	if err != nil {
+		debugLog("Verify failed for %s: %v", peerIP, err)
 		netChan <- peerVerifiedMsg{ip: peerIP, secure: false}
 		return
 	}
@@ -571,10 +582,13 @@ func verifyPeer(peerIP string, passHash string, netChan chan interface{}) {
 	fmt.Fprintf(conn, "VERIFY:%s\n", passHash)
 	resp, err := bufio.NewReader(conn).ReadString('\n')
 	if err != nil {
+		debugLog("Verify read error for %s: %v", peerIP, err)
 		netChan <- peerVerifiedMsg{ip: peerIP, secure: false}
 		return
 	}
-	netChan <- peerVerifiedMsg{ip: peerIP, secure: strings.TrimSpace(resp) == "VMATCH"}
+	match := strings.TrimSpace(resp) == "VMATCH"
+	debugLog("Verify result for %s: match=%v", peerIP, match)
+	netChan <- peerVerifiedMsg{ip: peerIP, secure: match}
 }
 
 func (m model) sendChatCmd(text string) tea.Cmd {
@@ -585,12 +599,15 @@ func (m model) sendChatCmd(text string) tea.Cmd {
 		}
 		defer conn.Close()
 		if m.password != "" && m.securePeers[m.selectedIP] {
+			debugLog("Sending encrypted chat to %s", m.selectedIP)
 			encrypted, err := encryptData([]byte(text), m.password)
 			if err != nil {
+				debugLog("Chat encryption error: %v", err)
 				return transferStatusMsg("Encryption error: " + err.Error())
 			}
 			fmt.Fprintf(conn, "ECHAT:%s:%s\n", m.userName, encrypted)
 		} else {
+			debugLog("Sending plaintext chat to %s", m.selectedIP)
 			fmt.Fprintf(conn, "CHAT:%s:%s\n", m.userName, text)
 		}
 		return nil
@@ -605,6 +622,7 @@ func (m model) sendFileCmd(path string) tea.Cmd {
 		conn, _ := net.Dial("tcp", m.selectedIP+":"+portTCP)
 		defer conn.Close()
 		if m.password != "" && m.securePeers[m.selectedIP] {
+			debugLog("Sending encrypted file %s to %s", fInfo.Name(), m.selectedIP)
 			fmt.Fprintf(conn, "EFILE:%s\n", fInfo.Name())
 			bufio.NewReader(conn).ReadString('\n') // wait for ACCEPTED
 			// Load file into memory for encryption (acceptable for LAN-sized files)
@@ -612,6 +630,7 @@ func (m model) sendFileCmd(path string) tea.Cmd {
 			encrypted, _ := encryptData(content, m.password)
 			conn.Write([]byte(encrypted))
 		} else {
+			debugLog("Sending plaintext file %s to %s", fInfo.Name(), m.selectedIP)
 			fmt.Fprintf(conn, "FILE:%s\n", fInfo.Name())
 			bufio.NewReader(conn).ReadString('\n')
 			io.Copy(conn, file)
@@ -642,18 +661,22 @@ func startTCPServer(netChan chan interface{}, password string, passHash string) 
 			} else if strings.HasPrefix(header, "EFILE:") {
 				fmt.Fprintln(c, "ACCEPTED")
 				name := strings.TrimSpace(strings.TrimPrefix(header, "EFILE:"))
+				debugLog("Receiving encrypted file: %s", name)
 				encoded, _ := io.ReadAll(reader)
 				if password != "" {
 					plaintext, err := decryptData(string(encoded), password)
 					if err != nil {
+						debugLog("File decryption failed for %s: %v", name, err)
 						netChan <- transferStatusMsg("Failed to decrypt file: " + name)
 					} else {
+						debugLog("File decrypted successfully: %s", name)
 						f, _ := os.Create("received_" + name)
 						f.Write(plaintext)
 						f.Close()
 						netChan <- transferStatusMsg("Received (encrypted): " + name)
 					}
 				} else {
+					debugLog("Encrypted file received but no password set: %s", name)
 					netChan <- transferStatusMsg("Encrypted file received but no password set: " + name)
 				}
 			} else if strings.HasPrefix(header, "CHAT:") {
@@ -666,22 +689,28 @@ func startTCPServer(netChan chan interface{}, password string, passHash string) 
 				if len(parts) == 2 {
 					sender := parts[0]
 					payload := strings.TrimSpace(parts[1])
+					debugLog("Received encrypted chat from %s", sender)
 					if password != "" {
 						plaintext, err := decryptData(payload, password)
 						if err != nil {
+							debugLog("Chat decryption failed from %s: %v", sender, err)
 							netChan <- chatMsg{sender: sender, content: "[Could not decrypt - password mismatch]"}
 						} else {
+							debugLog("Chat decrypted successfully from %s", sender)
 							netChan <- chatMsg{sender: sender, content: string(plaintext)}
 						}
 					} else {
+						debugLog("Encrypted chat from %s but no password set", sender)
 						netChan <- chatMsg{sender: sender, content: "[Encrypted message - no password set]"}
 					}
 				}
 			} else if strings.HasPrefix(header, "VERIFY:") {
 				remoteHash := strings.TrimSpace(strings.TrimPrefix(header, "VERIFY:"))
 				if passHash != "" && subtle.ConstantTimeCompare([]byte(remoteHash), []byte(passHash)) == 1 {
+					debugLog("VERIFY from %s: passwords match", c.RemoteAddr())
 					fmt.Fprintln(c, "VMATCH")
 				} else {
+					debugLog("VERIFY from %s: passwords do not match", c.RemoteAddr())
 					fmt.Fprintln(c, "VNOMATCH")
 				}
 			}
