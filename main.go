@@ -29,10 +29,11 @@ import (
 )
 
 const (
-	portUDP     = "9999"
-	portTCP     = "8080"
-	enableDebug = true // Set to false to disable debugging
+	portUDP = "9999"
+	portTCP = "8080"
 )
+
+var enableDebug bool
 
 // --- Debugging ---
 func debugLog(format string, v ...interface{}) {
@@ -748,9 +749,12 @@ func listenUDP(myName string, passHash string, netChan chan interface{}) {
 				continue
 			}
 			if _, seen := discovered.LoadOrStore(rAddr.IP.String(), pName); !seen {
+				debugLog("Discovered peer: %s (%s)", pName, rAddr.IP.String())
 				netChan <- peerUpdateMsg{name: pName, ip: rAddr.IP.String(), lastMsg: "Connected"}
 				if passHash != "" {
 					go verifyPeer(rAddr.IP.String(), passHash, netChan)
+				} else {
+					debugLog("No password set, skipping verification for %s", pName)
 				}
 			}
 		}
@@ -759,11 +763,12 @@ func listenUDP(myName string, passHash string, netChan chan interface{}) {
 
 func main() {
 	password := flag.String("pass", "", "Shared password for encrypted communication")
+	flag.BoolVar(&enableDebug, "debug", false, "Enable debug logging to debug.log")
 	flag.Parse()
 
 	args := flag.Args()
 	if len(args) < 1 {
-		fmt.Println("Usage: lan-chat [--pass=PASSWORD] <yourname>")
+		fmt.Println("Usage: lan-chat [--pass=PASSWORD] [--debug] <yourname>")
 		flag.PrintDefaults()
 		return
 	}
@@ -780,6 +785,11 @@ func main() {
 		if err == nil {
 			log.SetOutput(logFile)
 			debugLog("Starting LAN-CHAT for user: %s", name)
+			if pass != "" {
+				debugLog("Encryption ENABLED (--pass set)")
+			} else {
+				debugLog("Encryption DISABLED (no --pass flag)")
+			}
 		}
 	}
 
