@@ -35,6 +35,11 @@ The application requires a username argument and builds the binary automatically
 - Test peer discovery by running multiple instances on different machines
 - Verify file transfers and chat functionality
 
+### Git Workflow
+- **Remote Access**: Uses SSH for repository access (`git@github.com:HoldenMorris/LAN-CHAT.git`)
+- **Commits**: Follow conventional commits (e.g., `feat:`, `fix:`, `refactor:`, `docs:`)
+- **Pushing**: Ensure SSH keys are configured before pushing changes
+
 ## Code Conventions
 
 ### Go Style
