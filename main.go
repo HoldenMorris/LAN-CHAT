@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"strings"
@@ -22,7 +23,23 @@ import (
 const (
 	portUDP = "9999"
 	portTCP = "8080"
+	enableDebug = true // Set to false to disable debugging
 )
+
+// --- Debugging ---
+func debugLog(format string, v ...interface{}) {
+	if enableDebug {
+		log.Printf("[DEBUG] "+format, v...)
+	}
+}
+
+func logToFile(s string) {
+	if enableDebug {
+		f, _ := os.OpenFile("debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		defer f.Close()
+		f.WriteString(s + "\n")
+	}
+}
 
 // --- Messages ---
 type peerUpdateMsg struct{ name, ip, lastMsg string }
@@ -66,7 +83,7 @@ func initialModel(name string, netChan chan interface{}) model {
 
 	ti := textinput.New()
 	ti.Placeholder = "Type a message..."
-	ti.Focus()
+	// Don't focus by default, only focus when in chat mode
 
 	return model{
 		state:       0,
@@ -89,6 +106,7 @@ func waitForNetwork(ch chan interface{}) tea.Cmd {
 
 // --- Update ---
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	debugLog("Update: state=%d, msg=%T", m.state, msg)
 	var cmd tea.Cmd
 	var cmds []tea.Cmd
 
@@ -125,6 +143,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.state == 0 && m.list.SelectedItem() != nil {
 				m.selectedIP = m.list.SelectedItem().(item).desc
 				m.state = 3
+				m.textInput.Focus() // Focus input when entering chat mode
 				return m, nil
 			} else if m.state == 3 && m.textInput.Value() != "" {
 				text := m.textInput.Value()
@@ -158,8 +177,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.chatHistory = append(m.chatHistory, msg.sender+": "+msg.content)
 		m.viewport.SetContent(strings.Join(m.chatHistory, "\n"))
 		m.viewport.GotoBottom()
-		// Also update the preview in the list
-		return m, func() tea.Msg { return peerUpdateMsg{name: msg.sender, ip: "", lastMsg: msg.content} }
+		// Also update the preview in the list - find existing peer by name
+		items := m.list.Items()
+		for _, itm := range items {
+			if p := itm.(item); p.title == msg.sender {
+				return m, func() tea.Msg { return peerUpdateMsg{name: msg.sender, ip: p.desc, lastMsg: msg.content} }
+			}
+		}
+		return m, nil
 
 	case transferStatusMsg:
 		m.state = 0
@@ -167,10 +192,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, waitForNetwork(m.networkChan)
 
 	case tea.WindowSizeMsg:
-		m.list.SetSize(msg.Width-4, msg.Height-8)
-		m.filepicker.Height = msg.Height - 10
-		m.progress.Width = msg.Width - 10
-		m.viewport = viewport.New(msg.Width-4, msg.Height-10)
+		debugLog("WindowSize: %dx%d", msg.Width, msg.Height)
+		// Maximize component sizes accounting for borders and minimal margins
+		listWidth := msg.Width - 4  // 2 for margins, 2 for borders
+		listHeight := msg.Height - 6  // 2 for margins, 2 for borders, 2 for status
+		m.list.SetSize(listWidth, listHeight)
+		m.filepicker.Height = msg.Height - 8
+		m.progress.Width = msg.Width - 8
+		// For chat: split height between viewport and input
+		viewportHeight := msg.Height - 10  // Leave space for title, input, margins
+		m.viewport = viewport.New(msg.Width-4, viewportHeight)
+		debugLog("Component sizes: list=%dx%d, viewport=%dx%d", 
+			listWidth, listHeight, msg.Width-4, viewportHeight)
 	}
 
 	if m.state == 1 {
@@ -193,16 +226,40 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() string {
-	s := lipgloss.NewStyle().Margin(1, 2)
+	debugLog("View: state=%d, listItems=%d, viewportSize=%dx%d", 
+		m.state, len(m.list.Items()), m.viewport.Width, m.viewport.Height)
+	
+	// Define border styles with minimal padding
+	borderStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
+	filePickerStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
+	progressStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
+	chatViewportStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
+	inputStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
+	listStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
+	statusStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Border(lipgloss.RoundedBorder()).Padding(0, 1)
+
+	// Minimal margins to maximize space
+	containerStyle := lipgloss.NewStyle().Margin(0, 1)
+
 	switch m.state {
 	case 1:
-		return s.Render("Select File (Enter to select, Esc to go back):\n\n" + m.filepicker.View())
+		title := borderStyle.Render("Select File (Enter to select, Esc to go back)")
+		content := filePickerStyle.Render(m.filepicker.View())
+		return containerStyle.Render(title + "\n" + content)
 	case 2:
-		return s.Render(fmt.Sprintf("Sending to %s...\n\n%s", m.selectedIP, m.progress.View()))
+		title := borderStyle.Render(fmt.Sprintf("Sending to %s...", m.selectedIP))
+		content := progressStyle.Render(m.progress.View())
+		return containerStyle.Render(title + "\n" + content)
 	case 3:
-		return s.Render(fmt.Sprintf("Chat with %s (Esc to go back)\n\n%s\n\n%s", m.selectedIP, m.viewport.View(), m.textInput.View()))
+		title := borderStyle.Render(fmt.Sprintf("Chat with %s (Esc to go back)", m.selectedIP))
+		viewport := chatViewportStyle.Render(m.viewport.View())
+		input := inputStyle.Render(m.textInput.View())
+		// Join with minimal spacing
+		return containerStyle.Render(lipgloss.JoinVertical(lipgloss.Left, title, viewport, input))
 	default:
-		return s.Render(m.list.View() + "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Render(m.lastStatus))
+		list := listStyle.Render(m.list.View())
+		status := statusStyle.Render(m.lastStatus)
+		return containerStyle.Render(lipgloss.JoinVertical(lipgloss.Left, list, status))
 	}
 }
 
@@ -235,7 +292,11 @@ func (m model) sendFileCmd(path string) tea.Cmd {
 }
 
 func startTCPServer(netChan chan interface{}) {
-	ln, _ := net.Listen("tcp", ":"+portTCP)
+	ln, err := net.Listen("tcp", ":"+portTCP)
+	if err != nil {
+		netChan <- transferStatusMsg("TCP listen error: " + err.Error())
+		return
+	}
 	for {
 		conn, _ := ln.Accept()
 		go func(c net.Conn) {
@@ -260,7 +321,10 @@ func startTCPServer(netChan chan interface{}) {
 
 func broadcast(name string) {
 	addr, _ := net.ResolveUDPAddr("udp", "255.255.255.255:"+portUDP)
-	conn, _ := net.DialUDP("udp", nil, addr)
+	conn, err := net.DialUDP("udp", nil, addr)
+	if err != nil {
+		return
+	}
 	for {
 		conn.Write([]byte("IAM:" + name))
 		time.Sleep(3 * time.Second)
@@ -269,7 +333,11 @@ func broadcast(name string) {
 
 func listenUDP(myName string, netChan chan interface{}) {
 	addr, _ := net.ResolveUDPAddr("udp", ":"+portUDP)
-	conn, _ := net.ListenUDP("udp", addr)
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		netChan <- transferStatusMsg("UDP listen error: " + err.Error())
+		return
+	}
 	buf := make([]byte, 1024)
 	var discovered sync.Map
 	for {
@@ -293,12 +361,23 @@ func main() {
 		return
 	}
 	name := os.Args[1]
+	
+	if enableDebug {
+		logFile, err := os.OpenFile("debug.log", os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
+		if err == nil {
+			log.SetOutput(logFile)
+			debugLog("Starting LAN-CHAT for user: %s", name)
+		}
+	}
+	
 	netChan := make(chan interface{})
 	go broadcast(name)
 	go listenUDP(name, netChan)
 	go startTCPServer(netChan)
 
-	p := tea.NewProgram(initialModel(name, netChan), tea.WithAltScreen())
+	programOpts := []tea.ProgramOption{tea.WithAltScreen()}
+	
+	p := tea.NewProgram(initialModel(name, netChan), programOpts...)
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error: %v", err)
 	}
