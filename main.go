@@ -105,6 +105,7 @@ type transferStatusMsg string
 type chatMsg struct{ sender, content string }
 type progressMsg float64
 type peerVerifiedMsg struct{ ip string; secure bool }
+type configToggleDebugMsg struct{}
 
 // item implements list.Item
 type item struct {
@@ -128,7 +129,7 @@ func (i item) FilterValue() string { return i.title }
 
 // --- Model ---
 type model struct {
-	state       int // 0: list, 1: picker, 2: progress, 3: chat
+	state       int // 0: list, 1: picker, 2: progress, 3: chat, 4: config
 	list        list.Model
 	filepicker  filepicker.Model
 	progress    progress.Model
@@ -145,11 +146,12 @@ type model struct {
 	password    string
 	passHash    string
 	securePeers map[string]bool
+	configDebug bool
 }
 
 func initialModel(name string, password string, netChan chan interface{}) model {
 	l := list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0)
-	l.Title = "xYou are: " + name + " | (/) Filter (f) File (enter) Chat (esc) Quit"
+	l.Title = "xYou are: " + name + " | (/) Filter (f) File (c) Config (enter) Chat (esc) Quit"
 
 	// Remove 'q' from the help menu
 	l.KeyMap.Quit.SetKeys()
@@ -180,6 +182,7 @@ func initialModel(name string, password string, netChan chan interface{}) model 
 		password:    password,
 		passHash:    ph,
 		securePeers: make(map[string]bool),
+		configDebug: enableDebug,
 	}
 }
 
@@ -218,11 +221,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 
-			// 3. Otherwise, Esc acts as a "Back" button from Chat or File Picker
+			// 3. Otherwise, Esc acts as a "Back" button from Chat, File Picker, or Config
 			m.state = 0
 			m.textInput.Blur()
 			m.textInput.Reset()
 			return m, nil
+		case "c":
+			if m.state == 0 {
+				m.state = 4
+				return m, nil
+			}
 		case "f":
 			if m.state == 0 && m.list.SelectedItem() != nil {
 				item := m.list.SelectedItem().(item)
@@ -310,6 +318,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.resizeComponents(msg.Width, msg.Height)
+
+	case configToggleDebugMsg:
+		m.configDebug = !m.configDebug
+		enableDebug = m.configDebug
+		// Ensure log output is properly redirected
+		if enableDebug {
+			logFile, err := os.OpenFile("debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if err == nil {
+				log.SetOutput(logFile)
+			}
+		}
+		return m, nil
 	}
 
 	if m.state == 1 {
@@ -324,6 +344,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, cmd)
 		m.viewport, cmd = m.viewport.Update(msg)
 		cmds = append(cmds, cmd)
+	} else if m.state == 4 {
+		// Config state - handle key inputs
+		if keyMsg, ok := msg.(tea.KeyMsg); ok {
+			switch keyMsg.String() {
+			case "d":
+				return m, func() tea.Msg { return configToggleDebugMsg{} }
+			case "up", "down":
+				// Navigate through options (currently only debug)
+				return m, nil
+			}
+		}
+		return m, nil
 	} else {
 		m.list, cmd = m.list.Update(msg)
 		cmds = append(cmds, cmd)
@@ -538,6 +570,36 @@ func (m model) View() string {
 		input := inputStyle.Render(m.textInput.View())
 		
 		return containerStyle.Render(lipgloss.JoinVertical(lipgloss.Left, title, viewport, input, footer))
+	case 4:
+		title := borderStyle.Render("Configuration")
+		
+		// Config options
+		debugStatus := "OFF"
+		debugColor := lipgloss.Color("245") // Gray for OFF
+		if m.configDebug {
+			debugStatus = "ON"
+			debugColor = lipgloss.Color("10") // Green for ON
+		}
+		
+		debugStyle := lipgloss.NewStyle().Foreground(debugColor)
+		debugText := fmt.Sprintf("Debug Logging: %s", debugStyle.Render(debugStatus))
+		
+		// Create content area
+		contentStyle := fullWidthStyle.Copy().Border(lipgloss.RoundedBorder(), true, true, false, true)
+		content := contentStyle.Render(
+			lipgloss.JoinVertical(lipgloss.Left,
+				"",
+				debugText,
+				"",
+				"Press (d) to toggle debug logging",
+				"Press (esc) to go back",
+				"",
+			),
+		)
+		
+		footer := m.customBorderFooter(m.width, "(d) Toggle Debug | (esc) Back")
+		
+		return containerStyle.Render(lipgloss.JoinVertical(lipgloss.Left, title, content, footer))
 	default:
 		// Custom rendering for list to support "connected peers" text
 		var titleText string
@@ -552,7 +614,7 @@ func (m model) View() string {
 			} else {
 				titleText = fmt.Sprintf("You are: %s", m.userName)
 			}
-			footerText = "(/) Filter | (f) File (enter) Chat | (esc) Quit"
+			footerText = "(/) Filter | (f) File | (c) Config | (enter) Chat | (esc) Quit"
 		}
 		
 		title := borderStyle.Render(titleText)
